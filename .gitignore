@@ -1,0 +1,8 @@
+.vs/
+bin/
+obj/
+publish/
+release-pkg/
+*.user
+__pycache__/
+*.py[cod]

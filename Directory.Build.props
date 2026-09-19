@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <RunnerVersion Condition="'$(RunnerVersion)' == ''">$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)VERSION').Trim())</RunnerVersion>
+  </PropertyGroup>
+</Project>

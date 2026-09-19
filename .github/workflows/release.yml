@@ -1,0 +1,125 @@
+name: Build and release runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: lagrange-runner-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  detect-lagrange-change:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.detect.outputs.changed }}
+    steps:
+      - name: Checkout history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check vendored Lagrange.Core changes
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          # Manual runs are an explicit request to publish. Pushes publish
+          # only when the vendored (and therefore modified) Lagrange source
+          # changed; changes to the original qqsign checkout are irrelevant.
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            files=$(git ls-tree -r --name-only "$CURRENT_SHA" -- src/Lagrange.Core/)
+          else
+            files=$(git diff --name-only "$BEFORE_SHA" "$CURRENT_SHA" -- src/Lagrange.Core/)
+          fi
+
+          if [[ -n "$files" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: detect-lagrange-change
+    if: >-
+      needs.detect-lagrange-change.outputs.changed == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+      !contains(github.event.head_commit.message, '[skip ci]'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Bump release version
+        id: version
+        shell: bash
+        run: echo "version=$(python scripts/release.py --bump)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.x'
+
+      - name: Verify private signing backend is excluded
+        shell: bash
+        run: |
+          forbidden=$(git ls-files | grep -E '(^|/)(sign-server|ntqq-sign-server)(/|$)|(^|/)(wrapper\.node|symbols\.c|sign\.py)$' || true)
+          if [[ -n "$forbidden" ]]; then
+            echo "Private signing backend files must not be released:"
+            echo "$forbidden"
+            exit 1
+          fi
+
+      - name: Publish Linux runner
+        run: dotnet publish src/Runner/Runner.csproj -c Release -r linux-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=None -o publish/linux-x64
+
+      - name: Publish Windows runner
+        run: dotnet publish src/Runner/Runner.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:DebugType=None -o publish/win-x64
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p release-pkg/linux release-pkg/windows
+          cp publish/linux-x64/lagrange-runner release-pkg/linux/lagrange-runner
+          cp publish/win-x64/lagrange-runner.exe release-pkg/windows/lagrange-runner.exe
+          tar -C release-pkg/linux -czf "lagrange-runner-v${VERSION}-linux-x64.tar.gz" lagrange-runner
+          (cd release-pkg/windows && zip -q "../../lagrange-runner-v${VERSION}-win-x64.zip" lagrange-runner.exe)
+
+      - name: Commit version and tag
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add VERSION
+          git commit -m "chore: release v${VERSION} [skip ci]"
+          git tag "v${VERSION}"
+          git push origin HEAD:main --tags
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v${VERSION}" "lagrange-runner-v${VERSION}-linux-x64.tar.gz" "lagrange-runner-v${VERSION}-win-x64.zip" --title "lagrange-runner v${VERSION}" --generate-notes
