@@ -67,13 +67,23 @@ internal class SelfHostSignProvider : BotSignProvider
             if (!json.TryGetProperty("value", out var value))
                 throw new InvalidOperationException("sign server response does not contain value");
 
-            static byte[] ReadHex(JsonElement value, string name)
+            static byte[] ReadHex(JsonElement value, string name, bool required = false)
             {
                 if (!value.TryGetProperty(name, out var field))
+                {
+                    if (!required) return [];
                     throw new InvalidOperationException($"sign server response does not contain {name}");
+                }
                 var hex = field.GetString();
                 if (string.IsNullOrWhiteSpace(hex))
+                {
+                    // esign legitimately returns empty token/extra for some
+                    // commands. They are optional fields in SsoSecureInfo;
+                    // only the actual signature is required for whitelisted
+                    // packets.
+                    if (!required) return [];
                     throw new InvalidOperationException($"sign server returned empty {name}");
+                }
                 try
                 {
                     return Convert.FromHexString(hex);
@@ -86,7 +96,7 @@ internal class SelfHostSignProvider : BotSignProvider
 
             return new SsoSecureInfo
             {
-                SecSign = ReadHex(value, "sign"),
+                SecSign = ReadHex(value, "sign", required: true),
                 SecToken = ReadHex(value, "token"),
                 SecExtra = ReadHex(value, "extra"),
             };
