@@ -25,9 +25,13 @@ internal class SelfHostSignProvider : BotSignProvider
         DefaultRequestVersion = HttpVersion.Version11,
         DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact,
     };
-    private readonly string _url;
+    private readonly string _baseUrl;
 
-    public SelfHostSignProvider(string url) => _url = url.TrimEnd('/');
+    public SelfHostSignProvider(string url) => _baseUrl = url.TrimEnd('/');
+
+    private string Url => _baseUrl.Contains("/api/sign/", StringComparison.OrdinalIgnoreCase)
+        ? _baseUrl
+        : $"{_baseUrl}/api/sign/{Context.AppInfo.AppClientVersion}";
 
     public override bool IsWhiteListCommand(string cmd) => SignWhitelist.Commands.Contains(cmd);
 
@@ -52,7 +56,7 @@ internal class SelfHostSignProvider : BotSignProvider
                 CharSet = "utf-8",
             };
             content.Headers.ContentLength = requestBody.Length;
-            using var response = await _client.PostAsync(_url, content);
+            using var response = await _client.PostAsync(Url, content);
             if (!response.IsSuccessStatusCode)
             {
                 var error = await response.Content.ReadAsStringAsync();
@@ -60,30 +64,34 @@ internal class SelfHostSignProvider : BotSignProvider
                 // stay on stderr or the manager will parse them as protocol
                 // responses and lose login events.
                 Console.Error.WriteLine($"[sign] {cmd} -> HTTP {(int)response.StatusCode}: {error}");
-                throw new InvalidOperationException($"sign server returned HTTP {(int)response.StatusCode}");
+                // Match Lagrange.Core DefaultBotSignProvider: a non-success
+                // signer response means no security info for this packet.
+                return null;
             }
 
             var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement;
-            if (!json.TryGetProperty("value", out var value))
-                throw new InvalidOperationException("sign server response does not contain value");
+            var value = json.TryGetProperty("value", out var responseValue)
+                ? responseValue
+                : default;
 
             static byte[] ReadHex(JsonElement value, string name, bool required = false)
             {
+                if (value.ValueKind != JsonValueKind.Object)
+                {
+                    if (required) throw new InvalidOperationException($"sign server response does not contain {name}");
+                    return [];
+                }
                 if (!value.TryGetProperty(name, out var field))
                 {
-                    if (!required) return [];
-                    throw new InvalidOperationException($"sign server response does not contain {name}");
+                    if (required) throw new InvalidOperationException($"sign server response does not contain {name}");
+                    return [];
                 }
-                var hex = field.GetString();
-                if (string.IsNullOrWhiteSpace(hex))
-                {
-                    // esign legitimately returns empty token/extra for some
-                    // commands. They are optional fields in SsoSecureInfo;
-                    // only the actual signature is required for whitelisted
-                    // packets.
-                    if (!required) return [];
+                // Convert.FromHexString("") is an empty byte array, exactly
+                // what the official provider gives Lagrange for optional
+                // token/extra fields. Do not invent values or reject them.
+                var hex = field.GetString() ?? string.Empty;
+                if (required && string.IsNullOrWhiteSpace(hex))
                     throw new InvalidOperationException($"sign server returned empty {name}");
-                }
                 try
                 {
                     return Convert.FromHexString(hex);
@@ -245,9 +253,7 @@ internal static class Program
         var dir = Path.Combine(dataRoot, botId);
         Directory.CreateDirectory(dir);
         var keystorePath = Path.Combine(dir, "keystore.json");
-        var keystore = File.Exists(keystorePath)
-            ? JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(keystorePath)) ?? BotKeystore.CreateEmpty()
-            : BotKeystore.CreateEmpty();
+        var keystore = LoadKeystore(keystorePath);
 
         var context = BotFactory.Create(new BotConfig
         {
@@ -262,6 +268,52 @@ internal static class Program
 
         Write(new JsonObject { ["id"] = id, ["result"] = new JsonObject { ["bot_id"] = botId, ["created"] = true } });
         return Task.CompletedTask;
+    }
+
+    private static BotKeystore LoadKeystore(string path)
+    {
+        BotKeystore? keystore = null;
+        var shouldPersist = !File.Exists(path);
+        if (File.Exists(path))
+        {
+            try
+            {
+                keystore = JsonSerializer.Deserialize<BotKeystore>(File.ReadAllText(path));
+                shouldPersist = keystore is null;
+            }
+            catch (JsonException ex)
+            {
+                Console.Error.WriteLine($"[keystore] invalid file, regenerating device identity: {ex.Message}");
+                shouldPersist = true;
+            }
+        }
+
+        keystore ??= BotKeystore.CreateEmpty();
+        var changed = shouldPersist;
+        if (keystore.Guid is not { Length: 16 })
+        {
+            var guid = new byte[16];
+            Random.Shared.NextBytes(guid);
+            keystore.Guid = guid;
+            changed = true;
+        }
+        if (string.IsNullOrWhiteSpace(keystore.AndroidId))
+        {
+            var androidId = new byte[8];
+            Random.Shared.NextBytes(androidId);
+            keystore.AndroidId = Convert.ToHexString(androidId);
+            changed = true;
+        }
+        if (string.IsNullOrWhiteSpace(keystore.DeviceName))
+        {
+            // Derive the fallback from the persisted GUID so a repair never
+            // changes the device name on a later restart.
+            keystore.DeviceName = $"Lagrange-{Convert.ToHexString(keystore.Guid.AsSpan(0, 3))}";
+            changed = true;
+        }
+        if (changed)
+            File.WriteAllText(path, JsonSerializer.Serialize(keystore));
+        return keystore;
     }
 
     private static void RegisterEvents(BotInstance bot)
